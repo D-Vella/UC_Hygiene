@@ -32,6 +32,41 @@ class CheckResult:
     details: dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass
+class TableStats:
+    """Statistics for a single table."""
+    
+    full_name: str
+    column_count: int
+    missing_comment_count: int
+    void_column_count: int
+    void_column_names: list[str]
+    
+
+# Catalogs and schemas to skip
+SYSTEM_CATALOGS = frozenset({
+    "hive_metastore",
+    "system", 
+    "dbdemos",
+})
+
+SYSTEM_SCHEMAS = frozenset({
+    "information_schema",
+    "dbdemos",
+    "default",
+})
+
+
+def is_system_catalog(catalog_name: str) -> bool:
+    """Check if a catalog is a system catalog that should be skipped."""
+    return catalog_name.lower() in SYSTEM_CATALOGS
+
+
+def is_system_schema(schema_name: str) -> bool:
+    """Check if a schema is a system schema that should be skipped."""
+    return schema_name.lower() in SYSTEM_SCHEMAS
+
+
 def check_catalog_comments(client: UCHygieneClient) -> list[CheckResult]:
     """
     Check that all catalogs have comments/descriptions.
@@ -45,6 +80,9 @@ def check_catalog_comments(client: UCHygieneClient) -> list[CheckResult]:
     results = []
     
     for catalog in client.list_catalogs():
+        if is_system_catalog(catalog.name):
+            continue
+            
         if not catalog.comment:
             results.append(
                 CheckResult(
@@ -78,6 +116,8 @@ def check_schema_comments(
     catalogs = client.list_catalogs()
     
     for catalog in catalogs:
+        if is_system_catalog(catalog.name):
+            continue
         if catalog_filter and catalog.name != catalog_filter:
             continue
             
@@ -87,6 +127,9 @@ def check_schema_comments(
             continue
             
         for schema in schemas:
+            if is_system_schema(schema.name):
+                continue
+                
             if not schema.comment:
                 results.append(
                     CheckResult(
@@ -122,6 +165,7 @@ def check_table_comments(
     for catalog_name, schema_name, table in client.iter_all_tables(
         catalog_filter=catalog_filter,
         schema_filter=schema_filter,
+        skip_system_objects=True,
     ):
         if not table.comment:
             full_name = f"{catalog_name}.{schema_name}.{table.name}"
@@ -159,6 +203,7 @@ def check_column_comments(
     for catalog_name, schema_name, table in client.iter_all_tables(
         catalog_filter=catalog_filter,
         schema_filter=schema_filter,
+        skip_system_objects=True,
     ):
         full_name = f"{catalog_name}.{schema_name}.{table.name}"
         
@@ -208,6 +253,7 @@ def check_table_owners(
     for catalog_name, schema_name, table in client.iter_all_tables(
         catalog_filter=catalog_filter,
         schema_filter=schema_filter,
+        skip_system_objects=True,
     ):
         if not table.owner:
             full_name = f"{catalog_name}.{schema_name}.{table.name}"
@@ -243,6 +289,8 @@ def check_empty_schemas(
     catalogs = client.list_catalogs()
     
     for catalog in catalogs:
+        if is_system_catalog(catalog.name):
+            continue
         if catalog_filter and catalog.name != catalog_filter:
             continue
             
@@ -252,13 +300,12 @@ def check_empty_schemas(
             continue
             
         for schema in schemas:
-            # Skip information_schema and other system schemas
-            if schema.name.startswith("information_schema"):
+            if is_system_schema(schema.name):
                 continue
                 
             try:
-                tables = client.list_tables(catalog.name, schema.name)
-                if len(list(tables)) == 0:
+                tables = list(client.list_tables(catalog.name, schema.name))
+                if len(tables) == 0:
                     results.append(
                         CheckResult(
                             check_name="empty_schema",
@@ -272,6 +319,112 @@ def check_empty_schemas(
                 continue
     
     return results
+
+
+def check_void_columns(
+    client: UCHygieneClient,
+    catalog_filter: str | None = None,
+    schema_filter: str | None = None,
+) -> list[CheckResult]:
+    """
+    Check for tables containing void type columns.
+    
+    Void columns typically indicate schema inference issues or 
+    problematic data types that should be addressed.
+
+    Args:
+        client: The UCHygieneClient instance.
+        catalog_filter: Optional catalog name to limit scope.
+        schema_filter: Optional schema name to limit scope.
+
+    Returns:
+        List of CheckResult for tables with void columns.
+    """
+    results = []
+    
+    for catalog_name, schema_name, table in client.iter_all_tables(
+        catalog_filter=catalog_filter,
+        schema_filter=schema_filter,
+        skip_system_objects=True,
+    ):
+        full_name = f"{catalog_name}.{schema_name}.{table.name}"
+        
+        try:
+            columns = client.get_table_columns(full_name)
+        except Exception:
+            continue
+        
+        void_columns = [
+            col.name for col in columns
+            if col.type_name and col.type_name.lower() == "void"
+        ]
+        
+        if void_columns:
+            results.append(
+                CheckResult(
+                    check_name="void_columns",
+                    severity=CheckSeverity.WARNING,
+                    object_type="table",
+                    object_name=full_name,
+                    message=f"Table '{full_name}' has {len(void_columns)} void type columns",
+                    details={"void_columns": void_columns},
+                )
+            )
+    
+    return results
+
+
+def get_table_statistics(
+    client: UCHygieneClient,
+    catalog_filter: str | None = None,
+    schema_filter: str | None = None,
+) -> list[TableStats]:
+    """
+    Gather statistics for all tables including column counts and documentation coverage.
+    
+    This is an informational function rather than a check - it returns
+    statistics about tables without making judgements about pass/fail.
+
+    Args:
+        client: The UCHygieneClient instance.
+        catalog_filter: Optional catalog name to limit scope.
+        schema_filter: Optional schema name to limit scope.
+
+    Returns:
+        List of TableStats objects with statistics for each table.
+    """
+    stats = []
+    
+    for catalog_name, schema_name, table in client.iter_all_tables(
+        catalog_filter=catalog_filter,
+        schema_filter=schema_filter,
+        skip_system_objects=True,
+    ):
+        full_name = f"{catalog_name}.{schema_name}.{table.name}"
+        
+        try:
+            columns = client.get_table_columns(full_name)
+        except Exception:
+            continue
+        
+        column_count = len(columns)
+        missing_comment_count = sum(1 for col in columns if not col.comment)
+        void_columns = [
+            col.name for col in columns
+            if col.type_name and col.type_name.lower() == "void"
+        ]
+        
+        stats.append(
+            TableStats(
+                full_name=full_name,
+                column_count=column_count,
+                missing_comment_count=missing_comment_count,
+                void_column_count=len(void_columns),
+                void_column_names=void_columns,
+            )
+        )
+    
+    return stats
 
 
 def run_all_checks(
@@ -298,5 +451,6 @@ def run_all_checks(
     results.extend(check_column_comments(client, catalog_filter, schema_filter))
     results.extend(check_table_owners(client, catalog_filter, schema_filter))
     results.extend(check_empty_schemas(client, catalog_filter))
+    results.extend(check_void_columns(client, catalog_filter, schema_filter))
     
     return results

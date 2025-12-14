@@ -14,6 +14,20 @@ from databricks.sdk.service.catalog import (
 )
 
 
+# Catalogs and schemas to skip when filtering system objects
+SYSTEM_CATALOGS = frozenset({
+    "hive_metastore",
+    "system",
+    "dbdemos",
+})
+
+SYSTEM_SCHEMAS = frozenset({
+    "information_schema",
+    "dbdemos",
+    "default",
+})
+
+
 class UCHygieneClient:
     """
     Client for interacting with Unity Catalog.
@@ -26,6 +40,7 @@ class UCHygieneClient:
     1. Environment variables (DATABRICKS_HOST, DATABRICKS_TOKEN)
     2. Databricks CLI profile (~/.databrickscfg)
     3. Azure CLI authentication (if on Azure)
+    4. Notebook context (if running inside Databricks)
     
     Example:
         client = UCHygieneClient()
@@ -121,6 +136,7 @@ class UCHygieneClient:
         self, 
         catalog_filter: str | None = None,
         schema_filter: str | None = None,
+        skip_system_objects: bool = True,
     ):
         """
         Iterate over all tables across catalogs and schemas.
@@ -128,6 +144,7 @@ class UCHygieneClient:
         Args:
             catalog_filter: Optional catalog name to limit scope.
             schema_filter: Optional schema name to limit scope (requires catalog_filter).
+            skip_system_objects: If True, skip system catalogs and schemas.
 
         Yields:
             Tuples of (catalog_name, schema_name, TableInfo).
@@ -135,7 +152,12 @@ class UCHygieneClient:
         catalogs = self.list_catalogs()
         
         for catalog in catalogs:
+            # Apply catalog filter
             if catalog_filter and catalog.name != catalog_filter:
+                continue
+            
+            # Skip system catalogs
+            if skip_system_objects and catalog.name.lower() in SYSTEM_CATALOGS:
                 continue
                 
             try:
@@ -145,7 +167,12 @@ class UCHygieneClient:
                 continue
                 
             for schema in schemas:
+                # Apply schema filter
                 if schema_filter and schema.name != schema_filter:
+                    continue
+                
+                # Skip system schemas
+                if skip_system_objects and schema.name.lower() in SYSTEM_SCHEMAS:
                     continue
                     
                 try:
